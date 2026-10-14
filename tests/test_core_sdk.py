@@ -70,3 +70,13 @@ def test_empty_environment_env_var_is_unset(monkeypatch):
     client = traceroot.initialize(api_key="test-key", enabled=False)
 
     assert client.environment is None
+
+
+def test_empty_environment_argument_overrides_env_var(monkeypatch):
+    """Test environment="" turns off an inherited TRACEROOT_ENVIRONMENT."""
+    reset_traceroot()
+    monkeypatch.setenv("TRACEROOT_ENVIRONMENT", "staging")
+
+    client = traceroot.initialize(api_key="test-key", enabled=False, environment="")
+
+    assert client.environment is None

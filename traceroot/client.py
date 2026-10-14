@@ -110,8 +110,11 @@ class TracerootClient:
 
         self._integrations = integrations
 
-        # `or None` so an empty env var ("") is treated as unset.
-        self.environment = environment or os.environ.get(TRACEROOT_ENVIRONMENT) or None
+        # Read the env var only when no argument is given, so environment="" can
+        # turn off an inherited TRACEROOT_ENVIRONMENT. `or None` treats "" as unset.
+        if environment is None:
+            environment = os.environ.get(TRACEROOT_ENVIRONMENT)
+        self.environment = environment or None
 
         # Resolve git context: explicit > env > CI vars > auto-detect.
         # `or None` so an empty env var ("") is treated as unset — otherwise it

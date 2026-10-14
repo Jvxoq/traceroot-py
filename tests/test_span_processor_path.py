@@ -466,12 +466,13 @@ def test_environment_attrs_on_all_spans():
     provider.add_span_processor(proc)
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     tracer = provider.get_tracer("test")
-    with tracer.start_as_current_span("plain-span"):
+    with tracer.start_as_current_span("root"), tracer.start_as_current_span("child"):
         pass
     provider.force_flush()
-    span = next(s for s in exporter.get_finished_spans() if s.name == "plain-span")
-    assert span.attributes.get("traceroot.environment") == "staging"
-    assert span.attributes.get("deployment.environment") == "staging"
+    spans = {s.name: s for s in exporter.get_finished_spans()}
+    for name in ("root", "child"):
+        assert spans[name].attributes.get("traceroot.environment") == "staging"
+        assert spans[name].attributes.get("deployment.environment") == "staging"
 
 
 def test_environment_attrs_absent_when_not_configured():
