@@ -8,6 +8,7 @@ Covers:
   - Map entries are cleaned up on span end (no memory leak)
   - SDK name/version attributes are stamped on every recording span
   - Non-recording spans are silently skipped (no attributes, no map entries)
+  - redact rewrites a copy for export, keeps traceroot.* keys, and fails closed
 """
 
 import pytest
@@ -18,7 +19,8 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags
 
 from traceroot.constants import SDK_NAME, SDK_VERSION
-from traceroot.transport.span_processor import TracerootSpanProcessor
+from traceroot.span_attributes import SpanAttributes
+from traceroot.transport.span_processor import _REDACTABLE_KEYS, TracerootSpanProcessor
 
 # ── Fixture ────────────────────────────────────────────────────────────────────
 
@@ -447,3 +449,183 @@ def test_git_attrs_on_child_spans():
     child = next(s for s in exporter.get_finished_spans() if s.name == "child")
     assert child.attributes.get("traceroot.git.repo") == "org/repo"
     assert child.attributes.get("traceroot.git.ref") == "deadbeef" * 5
+
+
+# ── redact ─────────────────────────────────────────────────────────────────────
+
+
+def _finished(tracer, exporter, **attrs):
+    with tracer.start_as_current_span("llm") as span:
+        span.set_attributes(attrs)
+    return exporter.get_finished_spans()[0]
+
+
+def test_redact_unset_by_default(proc_setup):
+    _, _, processor = proc_setup
+    assert processor._redact is None
+
+
+def test_redact_rewrites_copy_and_leaves_original(proc_setup):
+    tracer, exporter, processor = proc_setup
+    processor._redact = lambda a: {**a, "user.email": "<email>"}
+    span = _finished(tracer, exporter, **{"user.email": "a@b.com"})
+    copy = processor._redacted(span)
+    assert copy.attributes["user.email"] == "<email>"
+    assert copy.attributes["traceroot.redacted"] is True
+    assert span.attributes["user.email"] == "a@b.com"
+
+
+def test_redact_cannot_drop_traceroot_keys(proc_setup):
+    tracer, exporter, processor = proc_setup
+    processor._redact = lambda a: {}
+    copy = processor._redacted(_finished(tracer, exporter, prompt="hi"))
+    assert "prompt" not in copy.attributes
+    assert copy.attributes["traceroot.sdk.name"] == SDK_NAME
+    assert _path(copy) == ["llm"]
+
+
+def test_redact_cannot_drop_ingest_keys(proc_setup):
+    tracer, exporter, processor = proc_setup
+    processor._redact = lambda a: {}
+    held = {
+        "user.id": "u1",
+        "session.id": "s1",
+        "llm.model_name": "gpt",
+        "llm.token_count.prompt": 12,
+    }
+    copy = processor._redacted(_finished(tracer, exporter, **held))
+    assert {k: copy.attributes[k] for k in held} == held
+
+
+def test_redact_sees_recorded_input(proc_setup):
+    tracer, exporter, processor = proc_setup
+    processor._redact = lambda a: {k: str(v).replace("a@b.com", "<email>") for k, v in a.items()}
+    span = _finished(tracer, exporter, **{"traceroot.span.input": '{"to": "a@b.com"}'})
+    copy = processor._redacted(span)
+    assert copy.attributes["traceroot.span.input"] == '{"to": "<email>"}'
+    assert _path(copy) == ["llm"]
+
+
+def test_redact_raising_fails_closed(proc_setup, caplog):
+    tracer, exporter, processor = proc_setup
+
+    def boom(attrs):
+        raise ValueError(f"bad {attrs['prompt']}")
+
+    processor._redact = boom
+    copy = processor._redacted(
+        _finished(
+            tracer,
+            exporter,
+            prompt="secret",
+            tokens=7,
+            tags=["a@b.com"],
+            **{"traceroot.span.metadata": "{}", "traceroot.trace.metadata": "{}"},
+        )
+    )
+    assert copy.attributes["prompt"] == "[redaction failed]"
+    assert copy.attributes["tags"] == "[redaction failed]"
+    assert copy.attributes["tokens"] == 7
+    assert "traceroot.span.metadata" not in copy.attributes
+    assert "traceroot.trace.metadata" not in copy.attributes
+    assert "ValueError" in caplog.text
+    assert "secret" not in caplog.text
+
+
+@pytest.mark.parametrize("returned", [None, ["x"]])
+def test_redact_non_dict_fails_closed(proc_setup, caplog, returned):
+    tracer, exporter, processor = proc_setup
+    processor._redact = lambda a: returned
+    copy = processor._redacted(_finished(tracer, exporter, prompt="secret", tokens=7))
+    assert copy.attributes["prompt"] == "[redaction failed]"
+    assert copy.attributes["tokens"] == 7
+    assert "TypeError" in caplog.text
+
+
+def test_redact_sees_eval_text_and_model_parameters(proc_setup):
+    tracer, exporter, processor = proc_setup
+    processor._redact = lambda a: dict.fromkeys(a, "<redacted>")
+    keys = [
+        "traceroot.eval.error",
+        "traceroot.eval.score_comment",
+        "traceroot.llm.model_parameters",
+    ]
+    copy = processor._redacted(_finished(tracer, exporter, **dict.fromkeys(keys, "a@b.com")))
+    assert all(copy.attributes[k] == "<redacted>" for k in keys)
+
+
+def test_redact_sees_string_score_value_numbers_survive_failure(proc_setup):
+    tracer, exporter, processor = proc_setup
+    key = SpanAttributes.EVAL_SCORE_VALUE
+    processor._redact = lambda a: {k: str(v).replace("a@b.com", "<email>") for k, v in a.items()}
+    assert (
+        processor._redacted(_finished(tracer, exporter, **{key: "a@b.com"})).attributes[key]
+        == "<email>"
+    )
+    exporter.clear()
+    processor._redact = _raise
+    assert processor._redacted(_finished(tracer, exporter, **{key: 0.5})).attributes[key] == 0.5
+
+
+def _raise(attrs):
+    raise ValueError
+
+
+@pytest.mark.parametrize("redact", [lambda a: {}, _raise], ids=["empty", "raising"])
+def test_redact_cannot_drop_span_kind_or_error_type(proc_setup, redact):
+    tracer, exporter, processor = proc_setup
+    processor._redact = redact
+    held = {
+        "openinference.span.kind": "LLM",
+        "gen_ai.operation.name": "chat",
+        "llm.model_name": "gpt",
+        "llm.token_count.prompt": 12,
+    }
+    with tracer.start_as_current_span("llm") as span:
+        span.set_attributes(held)
+        span.add_event("exception", {"exception.type": "ValueError"})
+    copy = processor._redacted(exporter.get_finished_spans()[0])
+    assert {k: copy.attributes[k] for k in held} == held
+    assert copy.events[0].attributes["exception.type"] == "ValueError"
+
+
+# Every traceroot.* key the SDK defines must be classified: content (redact sees it) or bookkeeping
+# (held back). A new SpanAttributes key fails here until someone decides which it is.
+_BOOKKEEPING_KEYS = {
+    SpanAttributes.SPAN_TYPE,
+    SpanAttributes.SPAN_TAGS,
+    SpanAttributes.LLM_MODEL,
+    SpanAttributes.LLM_USAGE,
+    SpanAttributes.TRACE_USER_ID,
+    SpanAttributes.TRACE_SESSION_ID,
+    SpanAttributes.TRACE_TAGS,
+    SpanAttributes.GIT_REPO,
+    SpanAttributes.GIT_REF,
+    SpanAttributes.GIT_SOURCE_FILE,
+    SpanAttributes.GIT_SOURCE_LINE,
+    SpanAttributes.GIT_SOURCE_FUNCTION,
+    SpanAttributes.ENVIRONMENT,
+    SpanAttributes.EVAL_CONTRACT_VERSION,
+    SpanAttributes.EVAL_NAME,
+    SpanAttributes.EVAL_RUN_NAME,
+    SpanAttributes.EVAL_RUN_ID,
+    SpanAttributes.EVAL_LOCAL_RUN_ID,
+    SpanAttributes.EVAL_DATASET_NAME,
+    SpanAttributes.EVAL_DATASET_ID,
+    SpanAttributes.EVAL_DATASET_VERSION_ID,
+    SpanAttributes.EVAL_CASE_ID,
+    SpanAttributes.EVAL_CANDIDATE_VERSION,
+    SpanAttributes.EVAL_ENVIRONMENT,
+    SpanAttributes.EVAL_HAS_EXPECTED,
+    SpanAttributes.EVAL_SOURCE_TRACE_ID,
+    SpanAttributes.EVAL_SOURCE_SPAN_ID,
+    SpanAttributes.EVAL_SCORE_TARGET_SPAN_ID,
+    SpanAttributes.EVAL_TASK_NAME,
+    SpanAttributes.EVAL_SCORER_NAME,
+}
+
+
+def test_every_traceroot_key_is_classified():
+    defined = {v for k, v in vars(SpanAttributes).items() if k.isupper()}
+    assert _REDACTABLE_KEYS.isdisjoint(_BOOKKEEPING_KEYS)
+    assert defined == _REDACTABLE_KEYS | _BOOKKEEPING_KEYS

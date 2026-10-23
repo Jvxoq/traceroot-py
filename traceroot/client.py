@@ -29,7 +29,7 @@ from traceroot.git_context import (
     harvest_ci_git_context,
 )
 from traceroot.instrumentation.registry import Integration
-from traceroot.transport.span_processor import LocalEvalSampler, TracerootSpanProcessor
+from traceroot.transport.span_processor import LocalEvalSampler, Redact, TracerootSpanProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +53,7 @@ class TracerootClient:
         integrations: list[Integration] | None = None,
         git_repo: str | None = None,
         git_ref: str | None = None,
+        redact: Redact | None = None,
     ):
         """Initialize the Traceroot client.
 
@@ -79,6 +80,18 @@ class TracerootClient:
             git_ref: Git reference (commit SHA, tag, branch).
                 Falls back to TRACEROOT_GIT_REF env var,
                 then auto-detected from git HEAD.
+            redact: Rewrites each finished span's attributes
+                before export, so personal data never
+                reaches TraceRoot (other exporters still see
+                the original span). Also runs on event
+                attributes and the status message.
+                TraceRoot's own bookkeeping keys are not
+                passed in; recorded input, output, metadata
+                and prompt are. Eval results are redacted
+                too; datasets and scorer definitions are
+                not. A raising function fails closed: every
+                value except numbers and booleans is
+                withheld, and recorded metadata is dropped.
         """
         # Resolve config with env var fallbacks
         self.api_key = api_key or os.environ.get(TRACEROOT_API_KEY, "")
@@ -104,6 +117,7 @@ class TracerootClient:
             enabled = env_enabled not in ("false", "0", "no", "off") if env_enabled else True
 
         self._integrations = integrations
+        self._redact = redact
 
         # Resolve git context: explicit > env > CI vars > auto-detect.
         # `or None` so an empty env var ("") is treated as unset — otherwise it
@@ -165,6 +179,7 @@ class TracerootClient:
             timeout=self.timeout,
             git_repo=self.git_repo,
             git_ref=self.git_ref,
+            redact=self._redact,
         )
 
         # OTel's global provider is set-once. If the host (e.g. `adk web`) already installed an SDK
