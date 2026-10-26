@@ -4,6 +4,7 @@ Network is stubbed via PlatformTransport._request so no real HTTP happens.
 """
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -114,6 +115,103 @@ class TestRunUrl:
         state = t.finish_run(RunHandle(name="e", dataset_name="d", metadata=None))
         assert state.dashboard_url is None
         assert state.status == "uploaded"
+
+
+def _redaction_item():
+    from traceroot.eval.results import EvalItemResult
+
+    return EvalItemResult(
+        case_id="tc0",
+        input="mail a@b.com",
+        output="sent to a@b.com",
+        expected="a@b.com",
+        scores=[Score("acc", 1.0, comment="a@b.com"), Score("label", "a@b.com")],
+        scorer_errors={"judge": "failed on a@b.com"},
+        error="boom a@b.com",
+        trace_id="abc123",
+    )
+
+
+class TestRedaction:
+    def _run(self, monkeypatch, redact):
+        monkeypatch.setattr(traceroot, "_client", SimpleNamespace(_redact=redact))
+        t = RecordingTransport("ds_1", scorer_names=["acc"], api_key="tr-x", host_url="https://h")
+        t.create_run("r", "d", {"owner": "a@b.com"})
+        t.record_item_result(None, _redaction_item())
+        return t.requests[0][2], t.requests[-1][2]
+
+    def test_eval_upload_carries_no_email(self, monkeypatch):
+        def scrub(attrs):
+            return {k: str(v).replace("a@b.com", "<email>") for k, v in attrs.items()}
+
+        run, result = self._run(monkeypatch, scrub)
+        assert "a@b.com" not in json.dumps(run) + json.dumps(result)
+        assert result["test_case_id"] == "tc0"
+        assert run["metadata"] == {"owner": "<email>"}
+
+    def test_each_score_is_redacted_on_its_own(self, monkeypatch):
+        seen = []
+
+        def record(attrs):
+            seen.append(attrs)
+            return dict.fromkeys(attrs, "<redacted>")
+
+        _, result = self._run(monkeypatch, record)
+        assert {"explanation": "a@b.com"} in seen
+        assert {"string_value": "a@b.com"} in seen
+        assert {"error": "failed on a@b.com"} in seen
+        assert [s.get("explanation") for s in result["scores"]] == ["<redacted>", None, None]
+
+    def test_redact_sees_the_full_value_before_it_is_clamped(self, monkeypatch):
+        from traceroot.eval.platform import _PAYLOAD_TEXT_MAX
+        from traceroot.eval.results import EvalItemResult
+
+        def scrub(attrs):
+            return {k: v.replace("john@example.com", "<email>") for k, v in attrs.items()}
+
+        monkeypatch.setattr(traceroot, "_client", SimpleNamespace(_redact=scrub))
+        t = RecordingTransport("ds_1", scorer_names=[], api_key="tr-x", host_url="https://h")
+        t.create_run("r", "d", None)
+        # The clamp cut lands inside the email, and the redacted value is still over the limit.
+        text = "x" * (_PAYLOAD_TEXT_MAX - 20) + "john@example.com" + "y" * 100
+        item = EvalItemResult("tc0", text, None, None, [], {}, None, None)
+        t.record_item_result(None, item)
+        sent = t.requests[-1][2]["input"]
+        assert "john@e" not in sent
+        assert len(sent) == _PAYLOAD_TEXT_MAX
+
+    def test_removed_input_is_sent_empty_and_bad_metadata_is_omitted(self, monkeypatch):
+        run, result = self._run(monkeypatch, lambda a: {})
+        assert result["input"] == ""
+        assert "metadata" not in run
+
+    def test_redact_applies_when_tracing_is_disabled(self):
+        from tests.utils import reset_traceroot
+
+        reset_traceroot()
+        traceroot.initialize(api_key="tr-x", enabled=False, redact=lambda a: {})
+        try:
+            t = RecordingTransport(
+                "ds_1", scorer_names=["acc"], api_key="tr-x", host_url="https://h"
+            )
+            t.create_run("r", "d", None)
+            t.record_item_result(None, _redaction_item())
+            assert "a@b.com" not in json.dumps(t.requests[-1][2])
+        finally:
+            reset_traceroot()
+
+    def test_raising_redact_blanks_text_keeps_scores_ids_status(self, monkeypatch):
+        def boom(attrs):
+            raise ValueError
+
+        run, result = self._run(monkeypatch, boom)
+        assert "metadata" not in run
+        assert result["input"] == result["task_error"] == "[redaction failed]"
+        assert (result["test_case_id"], result["trace_id"]) == ("tc0", "abc123")
+        assert result["status"] == "errored"
+        acc = result["scores"][0]
+        assert (acc["numeric_value"], acc["explanation"]) == (1.0, "[redaction failed]")
+        assert "a@b.com" not in json.dumps(run) + json.dumps(result)
 
 
 class TestPlatformTransport:

@@ -1,6 +1,6 @@
 [project]
 name = "traceroot"
-version = "0.3.0"
+version = "0.4.0"
 description = "Python SDK for TraceRoot"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -146,3 +146,13 @@ known-first-party = ["traceroot"]
 quote-style = "double"
 indent-style = "space"
 line-ending = "lf"
+
+[tool.uv]
+# google-adk (dev only) caps the opentelemetry family at <=1.44; override so the
+# lockfile can take the 1.45.1 security fix for opentelemetry-api. The family has
+# to move together because sdk and the exporters pin the api version exactly.
+override-dependencies = [
+    "opentelemetry-api>=1.45.1",
+    "opentelemetry-sdk>=1.45.1",
+    "opentelemetry-exporter-otlp-proto-http>=1.45.1",
+]

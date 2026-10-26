@@ -36,6 +36,28 @@ def _init():
     return traceroot.initialize(api_key="test-key", host_url="http://127.0.0.1:9")
 
 
+def test_initialize_applies_redact_to_auto_created_client(
+    memory_exporter, traceroot_exported, monkeypatch, caplog
+):
+    monkeypatch.setenv("TRACEROOT_API_KEY", "test-key")
+    monkeypatch.setenv("TRACEROOT_HOST_URL", "http://127.0.0.1:9")
+    traceroot.get_client()  # what an @observe call before initialize() does
+    with caplog.at_level(logging.WARNING):
+        traceroot.initialize(redact=lambda a: dict.fromkeys(a, "<redacted>"))
+    assert "were not redacted" in caplog.text
+
+    @observe(name="op")
+    def op(email):
+        return "ok"
+
+    op("a@b.com")
+    traceroot.flush()
+
+    attrs = traceroot_exported[0].attributes
+    assert attrs["traceroot.redacted"] is True
+    assert attrs["traceroot.span.input"] == "<redacted>"
+
+
 def test_joins_existing_global_provider(memory_exporter, traceroot_exported, caplog):
     host_provider = trace.get_tracer_provider()
 

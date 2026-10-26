@@ -34,6 +34,7 @@ from traceroot.eval.results import EvalItemResult, UploadState
 from traceroot.eval.results import case_status as _case_status
 from traceroot.eval.transport import PublishResult, RunHandle
 from traceroot.eval.types import Dataset, EvalCase, Score, _content_revision
+from traceroot.transport.span_processor import Redact, redact_attributes
 from traceroot.utils import serialize_value
 
 _DEFAULT_PASS_THRESHOLD = 1.0
@@ -197,6 +198,68 @@ def _resolve_credentials(api_key: str | None, host_url: str | None) -> tuple[str
             api_key = api_key if api_key is not None else client.api_key
             host_url = host_url if host_url is not None else client.host_url
     return api_key or "", host_url or ""
+
+
+# Free-text fields of eval uploads that the configured redact rewrites. Each request body (and each
+# score) goes through as its own flat dict of just these keys, so ids, status and score values are
+# never passed in and can never be blanked.
+_REDACTABLE_FIELDS = (
+    "input",
+    "expected_output",
+    "candidate_output",
+    "task_error",
+    "explanation",
+    "error",
+    "string_value",
+)
+
+
+def _configured_redact() -> Redact | None:
+    """The global client's redact, without creating a client."""
+    import traceroot
+
+    return getattr(traceroot._client, "_redact", None)
+
+
+def _redact_text(body: dict[str, Any]) -> dict[str, Any]:
+    """Apply the configured redact to ``body``'s free-text fields (no-op when unset)."""
+    redact = _configured_redact()
+    text = {k: body[k] for k in _REDACTABLE_FIELDS if body.get(k) is not None}
+    if redact is None or not text:
+        return body
+    redacted = redact_attributes(redact, text)
+    return {**body, **{k: redacted.get(k) for k in text}}
+
+
+# Contract limits of those fields, applied after redact so it always sees the whole value.
+_TEXT_LIMITS = {
+    "input": _PAYLOAD_TEXT_MAX,
+    "expected_output": _PAYLOAD_TEXT_MAX,
+    "candidate_output": _PAYLOAD_TEXT_MAX,
+    "task_error": _TASK_ERROR_MAX,
+    "explanation": _EXPLANATION_MAX,
+    "error": _SCORE_ERROR_MAX,
+    "string_value": _STRING_VALUE_MAX,
+}
+
+
+def _clamp_text(body: dict[str, Any]) -> dict[str, Any]:
+    """Clamp ``body``'s free-text fields to their contract limits."""
+    return {**body, **{k: _clamp(body[k], n) for k, n in _TEXT_LIMITS.items() if k in body}}
+
+
+def _redact_metadata(metadata: dict) -> Any:
+    """Pass run metadata to the configured redact as JSON text under ``metadata``. Anything that
+    does not parse back to a JSON object (including a failed redact) is omitted (None)."""
+    redact = _configured_redact()
+    if redact is None:
+        return metadata
+    try:
+        text = json.dumps(serialize_value(metadata))
+        parsed = json.loads(redact_attributes(redact, {"metadata": text}).get("metadata"))
+    except (TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _http_json(method: str, url: str, api_key: str, body: dict | None = None) -> dict:
@@ -380,8 +443,10 @@ class PlatformTransport:
         # match its absent-or-null rules rather than sending an empty object. Clamped like every
         # other capped field: metadata is whatever the caller put there (a whole prompt, a config
         # dump), and over the cap the REGISTRATION 400s -- the run then never starts at all.
-        if metadata:
-            body["metadata"] = _clamp_metadata(metadata, _METADATA_MAX)
+        # Scorer definitions (`scorers`) are not redacted; only the run's free-form metadata is.
+        sent_metadata = _redact_metadata(metadata) if metadata else None
+        if sent_metadata:
+            body["metadata"] = _clamp_metadata(sent_metadata, _METADATA_MAX)
         resp = self._request_with_retry("POST", "/api/v1/public/evaluation-runs", body)
         self.run_id = resp["evaluation_run_id"]
         # Optional, absent on older/self-hosted backends. Prefer the absolute run_url
@@ -441,26 +506,25 @@ class PlatformTransport:
         # _scores_payload), so it errors the case exactly like a raised scorer would.
         non_finite = sum(1 for s in item_result.scores if _is_non_finite(s.value))
         status = "errored" if non_finite else _case_status(item_result)
-        self._request(
-            "POST",
-            f"/api/v1/public/evaluation-runs/{self.run_id}/results",
-            {
-                "test_case_id": item_result.case_id,
-                "trace_id": item_result.trace_id,
-                # The backend validates these as strings (z.string()); serialize
-                # non-string values (dicts/numbers) to JSON text. `input` is a
-                # REQUIRED string (not nullable) -> coerce a missing input to "".
-                "input": _clamp(_as_text(item_result.input), _PAYLOAD_TEXT_MAX) or "",
-                "expected_output": _clamp(_as_text(item_result.expected), _PAYLOAD_TEXT_MAX),
-                "candidate_output": _clamp(_as_text(item_result.output), _PAYLOAD_TEXT_MAX),
-                "status": status,
-                "task_error": _clamp(item_result.error, _TASK_ERROR_MAX),
-                # Total wall-clock for this case (task + its scorers); nonneg int ms, null
-                # when unknown. Run duration is NOT summed from cases (they run concurrently).
-                "duration_ms": _duration_ms(item_result.duration_ms),
-                "scores": self._scores_payload(item_result),
-            },
-        )
+        body = {
+            "test_case_id": item_result.case_id,
+            "trace_id": item_result.trace_id,
+            # The backend validates these as strings (z.string()); serialize
+            # non-string values (dicts/numbers) to JSON text. `input` is a
+            # REQUIRED string (not nullable) -> coerce a missing input to "".
+            "input": _as_text(item_result.input) or "",
+            "expected_output": _as_text(item_result.expected),
+            "candidate_output": _as_text(item_result.output),
+            "status": status,
+            "task_error": item_result.error,
+            # Total wall-clock for this case (task + its scorers); nonneg int ms, null
+            # when unknown. Run duration is NOT summed from cases (they run concurrently).
+            "duration_ms": _duration_ms(item_result.duration_ms),
+            "scores": [_clamp_text(_redact_text(s)) for s in self._scores_payload(item_result)],
+        }
+        body = _clamp_text(_redact_text(body))
+        body["input"] = body["input"] or ""  # required string; redact may have removed it
+        self._request("POST", f"/api/v1/public/evaluation-runs/{self.run_id}/results", body)
         # Record this case's contribution only AFTER the upsert persisted, keyed by id so a
         # retry or repeated upload replaces (not adds to) the completion aggregate. A case
         # that produced at least one score (and no task error) counts toward scored_count;
@@ -560,7 +624,7 @@ class PlatformTransport:
                 # that the backend's JSON.parse rejects (400ing the whole run) while JavaScript
                 # writes null (a silently fabricated empty score that poisons the aggregate mean).
                 # Both SDKs report it as what it is: the scorer failed to produce a value.
-                entry["error"] = _clamp(_non_finite_error(s.name, v), _SCORE_ERROR_MAX)
+                entry["error"] = _non_finite_error(s.name, v)
                 payload.append(entry)
                 continue
             if isinstance(v, bool):
@@ -568,9 +632,9 @@ class PlatformTransport:
             elif isinstance(v, (int, float)):
                 entry["numeric_value"] = float(v)
             else:
-                entry["string_value"] = _clamp(str(v), _STRING_VALUE_MAX)
+                entry["string_value"] = str(v)
             if s.comment is not None:
-                entry["explanation"] = _clamp(s.comment, _EXPLANATION_MAX)
+                entry["explanation"] = s.comment
             passed = self._score_passed(s, single_emission=len(item_result.scores) == 1)
             if passed is not None:
                 entry["passed"] = passed
@@ -583,7 +647,7 @@ class PlatformTransport:
                 {
                     "scorer_name": name,
                     "scorer_version": self._declared_version(name),
-                    "error": _clamp(msg, _SCORE_ERROR_MAX),
+                    "error": msg,
                 }
             )
         return payload

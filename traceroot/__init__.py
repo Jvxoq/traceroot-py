@@ -34,6 +34,7 @@ from traceroot.constants import SDK_VERSION as __version__
 from traceroot.context import get_current_span_id, get_current_trace_id
 from traceroot.decorators import observe
 from traceroot.instrumentation import Integration
+from traceroot.transport.span_processor import Redact
 from traceroot.update import update_current_span, update_current_trace
 
 logger = logging.getLogger(__name__)
@@ -55,6 +56,7 @@ def initialize(
     integrations: list[Integration] | None = None,
     git_repo: str | None = None,
     git_ref: str | None = None,
+    redact: Redact | None = None,
     environment: str | None = None,
 ) -> TracerootClient:
     """Initialize the global Traceroot client.
@@ -74,6 +76,14 @@ def initialize(
             TRACEROOT_ENABLED env var, then True.
         integrations: Libraries to auto-instrument. Use Integration enum
             values (e.g. [Integration.OPENAI, Integration.LANGCHAIN]).
+        redact: Rewrites each finished span's attributes before export, so
+            personal data never reaches TraceRoot (other exporters still see
+            the original span). Also runs on event attributes and the status
+            message. TraceRoot's own bookkeeping keys are not passed in;
+            recorded input, output, metadata and prompt are. Eval results are
+            redacted too; datasets and scorer definitions are not. A raising
+            function fails closed: every value except numbers and booleans is
+            withheld, and recorded metadata is dropped.
         environment: Deployment environment name (e.g. "production").
             Defaults to TRACEROOT_ENVIRONMENT env var. When neither is set,
             no environment attribute is written.
@@ -93,6 +103,15 @@ def initialize(
     global _client
     with _init_lock:
         if _client is not None:
+            # An @observe call may have auto-created the client; redact must still apply.
+            if redact is not None:
+                _client._redact = redact
+                if _client._span_processor is not None:
+                    _client._span_processor._redact = redact
+                    logger.warning(
+                        "traceroot.initialize(redact=...) after the client was created — spans "
+                        "exported before this call were not redacted."
+                    )
             logger.warning(
                 "traceroot.initialize() called more than once — ignoring. "
                 "Call traceroot.shutdown() first if you need to reinitialize."
@@ -108,6 +127,7 @@ def initialize(
             integrations=integrations,
             git_repo=git_repo,
             git_ref=git_ref,
+            redact=redact,
             environment=environment,
         )
     return _client
